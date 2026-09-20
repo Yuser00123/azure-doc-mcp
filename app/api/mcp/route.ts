@@ -1,7 +1,8 @@
 import { createMcpHandler } from '@vercel/mcp-adapter';
 import DocumentIntelligence, {
   isUnexpected,
-  getLongRunningPoller
+  getLongRunningPoller,
+  AnalyzeOperationOutput
 } from '@azure-rest/ai-document-intelligence';
 import { z } from 'zod';
 
@@ -44,7 +45,8 @@ const handler = createMcpHandler((server) => {
         }
 
         const poller = getLongRunningPoller(client, initialResponse);
-        const analyzeResult = (await poller.pollUntilDone()).body.analyzeResult;
+        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
+        const analyzeResult = result.analyzeResult;
 
         const document = analyzeResult?.documents?.[0];
         if (!document) {
@@ -105,7 +107,8 @@ const handler = createMcpHandler((server) => {
         }
 
         const poller = getLongRunningPoller(client, initialResponse);
-        const analyzeResult = (await poller.pollUntilDone()).body.analyzeResult;
+        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
+        const analyzeResult = result.analyzeResult;
 
         const tablesCount = analyzeResult?.tables?.length || 0;
         const paragraphs = analyzeResult?.paragraphs?.map((p) => p.content).join('\n') || '';
@@ -159,7 +162,8 @@ const handler = createMcpHandler((server) => {
         }
 
         const poller = getLongRunningPoller(client, initialResponse);
-        const analyzeResult = (await poller.pollUntilDone()).body.analyzeResult;
+        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
+        const analyzeResult = result.analyzeResult;
 
         const document = analyzeResult?.documents?.[0];
         if (!document) {
