@@ -31,7 +31,7 @@ const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 // public URL that is a serious exposure, so it is opt-in.
 const ENABLE_ID_DOCUMENT = process.env.ENABLE_ID_DOCUMENT === 'true';
 
-const MAX_DOC_BYTES = 4 * 1024 * 1024; // free tier / request limits
+const MAX_DOC_BYTES = 3 * 1024 * 1024; // see note: Vercel body limit, not Azure's
 const MAX_TEXT_OUT = 8000;             // paragraph dump can be huge
 const POLL_DEADLINE_MS = 50_000;       // stay under maxDuration
 
@@ -56,7 +56,8 @@ function buildPayload(base64Data?: string, urlSource?: string) {
   const approxBytes = Math.floor((clean.length * 3) / 4);
   if (approxBytes > MAX_DOC_BYTES) {
     throw new Error(
-      `Document is ~${(approxBytes / 1048576).toFixed(1)}MB; limit is 4MB. ` +
+      `Document is ~${(approxBytes / 1048576).toFixed(1)}MB. Limit is 3MB: base64 inflates ` +
+        `size ~33% and Vercel 413s bodies over 4.5MB before this handler runs. ` +
         `Upload it somewhere public and pass urlSource instead.`
     );
   }
