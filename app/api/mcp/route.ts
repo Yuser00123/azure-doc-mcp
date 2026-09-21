@@ -2,194 +2,240 @@ import { createMcpHandler } from '@vercel/mcp-adapter';
 import DocumentIntelligence, {
   isUnexpected,
   getLongRunningPoller,
-  AnalyzeOperationOutput
+  AnalyzeOperationOutput,
 } from '@azure-rest/ai-document-intelligence';
 import { z } from 'zod';
 
-const endpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT || '';
-const apiKey = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY || '';
+// ---------------------------------------------------------------------------
+// Runtime config
+// ---------------------------------------------------------------------------
+export const runtime = 'nodejs';
 
-// Initialize client
+// 🔴 CRITICAL. Vercel Hobby defaults to maxDuration = 10s. Document
+// Intelligence is an async long-running operation — you POST, then poll until
+// done. A multi-page PDF routinely takes 15-40s. Without this export the
+// function was being killed mid-poll.
+export const maxDuration = 60;
+
+const endpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
+const apiKey = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY;
+if (!endpoint || !apiKey) {
+  throw new Error(
+    'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY must be set'
+  );
+}
+
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+
+// prebuilt-idDocument extracts names, DOB and document numbers. Behind a
+// public URL that is a serious exposure, so it is opt-in.
+const ENABLE_ID_DOCUMENT = process.env.ENABLE_ID_DOCUMENT === 'true';
+
+const MAX_DOC_BYTES = 4 * 1024 * 1024; // free tier / request limits
+const MAX_TEXT_OUT = 8000;             // paragraph dump can be huge
+const POLL_DEADLINE_MS = 50_000;       // stay under maxDuration
+
 const client = DocumentIntelligence(endpoint, { key: apiKey });
 
-const handler = createMcpHandler((server) => {
-  // -------------------------------------------------------------
-  // Tool 1: Analyze Invoice (Base64 or URL)
-  // -------------------------------------------------------------
-  server.tool(
-    'analyze_invoice',
-    'Extracts key data fields (Vendor, Total, Dates, Line Items) from an invoice PDF or image.',
-    {
-      base64Data: z.string().optional().describe('Base64 encoded string of invoice file (PDF, JPG, PNG)'),
-      urlSource: z.string().url().optional().describe('Public HTTP/HTTPS URL of the invoice')
-    },
-    async ({ base64Data, urlSource }) => {
-      try {
-        if (!base64Data && !urlSource) {
-          throw new Error('Either base64Data or urlSource must be provided.');
-        }
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function truncate(s: string, n = MAX_TEXT_OUT): string {
+  return s.length > n ? `${s.slice(0, n)}\n…[truncated ${s.length - n} chars]` : s;
+}
 
-        const bodyPayload = urlSource
-          ? { urlSource }
-          : { base64Source: base64Data!.replace(/^data:.*?;base64,/, '') };
-
-        const initialResponse = await client
-          .path('/documentModels/{modelId}:analyze', 'prebuilt-invoice')
-          .post({
-            contentType: 'application/json',
-            body: bodyPayload
-          });
-
-        if (isUnexpected(initialResponse)) {
-          throw new Error(initialResponse.body.error?.message || 'Invoice analysis failed.');
-        }
-
-        const poller = getLongRunningPoller(client, initialResponse);
-        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
-        const analyzeResult = result.analyzeResult;
-
-        const document = analyzeResult?.documents?.[0];
-        if (!document) {
-          return { content: [{ type: 'text', text: 'No structured invoice data detected.' }] };
-        }
-
-        const fields = document.fields || {};
-        const extractedSummary = [
-          `Vendor Name: ${fields.VendorName?.content || 'N/A'}`,
-          `Customer Name: ${fields.CustomerName?.content || 'N/A'}`,
-          `Invoice ID: ${fields.InvoiceId?.content || 'N/A'}`,
-          `Invoice Date: ${fields.InvoiceDate?.content || 'N/A'}`,
-          `Due Date: ${fields.DueDate?.content || 'N/A'}`,
-          `SubTotal: ${fields.SubTotal?.content || 'N/A'}`,
-          `Total Tax: ${fields.TotalTax?.content || 'N/A'}`,
-          `Invoice Total: ${fields.InvoiceTotal?.content || 'N/A'}`
-        ].join('\n');
-
-        return { content: [{ type: 'text', text: extractedSummary }] };
-      } catch (error: any) {
-        return {
-          content: [{ type: 'text', text: `Error processing invoice: ${error.message}` }],
-          isError: true
-        };
-      }
-    }
-  );
-
-  // -------------------------------------------------------------
-  // Tool 2: Analyze Layout & Extract Tables (Base64 or URL)
-  // -------------------------------------------------------------
-  server.tool(
-    'analyze_layout_tables',
-    'Extracts layout structure, paragraphs, and tables from complex documents or PDFs.',
-    {
-      base64Data: z.string().optional().describe('Base64 encoded string of document file'),
-      urlSource: z.string().url().optional().describe('Public URL of the document')
-    },
-    async ({ base64Data, urlSource }) => {
-      try {
-        if (!base64Data && !urlSource) {
-          throw new Error('Either base64Data or urlSource must be provided.');
-        }
-
-        const bodyPayload = urlSource
-          ? { urlSource }
-          : { base64Source: base64Data!.replace(/^data:.*?;base64,/, '') };
-
-        const initialResponse = await client
-          .path('/documentModels/{modelId}:analyze', 'prebuilt-layout')
-          .post({
-            contentType: 'application/json',
-            body: bodyPayload
-          });
-
-        if (isUnexpected(initialResponse)) {
-          throw new Error(initialResponse.body.error?.message || 'Layout analysis failed.');
-        }
-
-        const poller = getLongRunningPoller(client, initialResponse);
-        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
-        const analyzeResult = result.analyzeResult;
-
-        const tablesCount = analyzeResult?.tables?.length || 0;
-        const paragraphs = analyzeResult?.paragraphs?.map((p) => p.content).join('\n') || '';
-
-        const output = [
-          `Total Pages: ${analyzeResult?.pages?.length || 0}`,
-          `Total Tables Extracted: ${tablesCount}`,
-          `\n--- Text Content ---`,
-          paragraphs.length > 0 ? paragraphs : 'No paragraph text extracted.'
-        ].join('\n');
-
-        return { content: [{ type: 'text', text: output }] };
-      } catch (error: any) {
-        return {
-          content: [{ type: 'text', text: `Error reading layout: ${error.message}` }],
-          isError: true
-        };
-      }
-    }
-  );
-
-  // -------------------------------------------------------------
-  // Tool 3: Analyze ID / Passport Documents
-  // -------------------------------------------------------------
-  server.tool(
-    'analyze_id_document',
-    'Extracts identity information from passports, driver licenses, or ID cards.',
-    {
-      base64Data: z.string().optional().describe('Base64 encoded image of ID document'),
-      urlSource: z.string().url().optional().describe('Public URL of ID image')
-    },
-    async ({ base64Data, urlSource }) => {
-      try {
-        if (!base64Data && !urlSource) {
-          throw new Error('Either base64Data or urlSource must be provided.');
-        }
-
-        const bodyPayload = urlSource
-          ? { urlSource }
-          : { base64Source: base64Data!.replace(/^data:.*?;base64,/, '') };
-
-        const initialResponse = await client
-          .path('/documentModels/{modelId}:analyze', 'prebuilt-idDocument')
-          .post({
-            contentType: 'application/json',
-            body: bodyPayload
-          });
-
-        if (isUnexpected(initialResponse)) {
-          throw new Error(initialResponse.body.error?.message || 'ID analysis failed.');
-        }
-
-        const poller = getLongRunningPoller(client, initialResponse);
-        const result = (await poller.pollUntilDone()).body as AnalyzeOperationOutput;
-        const analyzeResult = result.analyzeResult;
-
-        const document = analyzeResult?.documents?.[0];
-        if (!document) {
-          return { content: [{ type: 'text', text: 'No structured ID document data detected.' }] };
-        }
-
-        const fields = document.fields || {};
-        const extractedSummary = [
-          `First Name: ${fields.FirstName?.content || 'N/A'}`,
-          `Last Name: ${fields.LastName?.content || 'N/A'}`,
-          `Document Number: ${fields.DocumentNumber?.content || 'N/A'}`,
-          `Date of Birth: ${fields.DateOfBirth?.content || 'N/A'}`,
-          `Date of Expiration: ${fields.DateOfExpiration?.content || 'N/A'}`,
-          `Country/Region: ${fields.CountryRegion?.content || 'N/A'}`
-        ].join('\n');
-
-        return { content: [{ type: 'text', text: extractedSummary }] };
-      } catch (error: any) {
-        return {
-          content: [{ type: 'text', text: `Error processing ID document: ${error.message}` }],
-          isError: true
-        };
-      }
-    }
-  );
+const err = (msg: string) => ({
+  content: [{ type: 'text' as const, text: msg }],
+  isError: true,
 });
 
-export const GET = handler;
-export const POST = handler;
+function buildPayload(base64Data?: string, urlSource?: string) {
+  if (urlSource) return { urlSource };
+  if (!base64Data) throw new Error('Either base64Data or urlSource must be provided.');
+  const clean = base64Data.replace(/^data:[^;]*;base64,/, '');
+  const approxBytes = Math.floor((clean.length * 3) / 4);
+  if (approxBytes > MAX_DOC_BYTES) {
+    throw new Error(
+      `Document is ~${(approxBytes / 1048576).toFixed(1)}MB; limit is 4MB. ` +
+        `Upload it somewhere public and pass urlSource instead.`
+    );
+  }
+  return { base64Source: clean };
+}
+
+/** POST to a prebuilt model and poll with a hard deadline. */
+async function analyze(modelId: string, body: Record<string, unknown>) {
+  const initial = await client
+    .path('/documentModels/{modelId}:analyze', modelId)
+    .post({ contentType: 'application/json', body });
+
+  if (isUnexpected(initial)) {
+    throw new Error(initial.body.error?.message || `${modelId} analysis failed.`);
+  }
+
+  const poller = getLongRunningPoller(client, initial);
+
+  // Previously: await poller.pollUntilDone() with no bound. On a slow or large
+  // document that ran past the platform timeout and returned a 504.
+  const done = await Promise.race([
+    poller.pollUntilDone(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), POLL_DEADLINE_MS)),
+  ]);
+  if (!done) {
+    throw new Error(
+      `Analysis did not finish within ${POLL_DEADLINE_MS / 1000}s. ` +
+        `Retry with fewer pages or a smaller file.`
+    );
+  }
+
+  return (done as { body: AnalyzeOperationOutput }).body.analyzeResult;
+}
+
+const sourceSchema = {
+  base64Data: z.string().optional().describe('Base64 of the document (PDF, JPG, PNG)'),
+  urlSource: z
+    .string()
+    .url()
+    .optional()
+    .describe('Public URL of the document. PREFERRED over base64Data.'),
+};
+
+// ---------------------------------------------------------------------------
+// Field renderers
+// ---------------------------------------------------------------------------
+function renderFields(fields: Record<string, any>, keys: string[]): string {
+  return keys
+    .map((k) => `${k.replace(/([A-Z])/g, ' $1').trim()}: ${fields[k]?.content ?? 'N/A'}`)
+    .join('\n');
+}
+
+/** 🔴 Previously tables were COUNTED and then thrown away — the tool is named
+ *  analyze_layout_tables but never returned a single table cell. */
+function renderTables(tables: any[]): string {
+  if (!tables?.length) return 'No tables found.';
+  return tables
+    .slice(0, 5)
+    .map((t, i) => {
+      const rows: string[][] = [];
+      for (const cell of t.cells || []) {
+        rows[cell.rowIndex] = rows[cell.rowIndex] || [];
+        rows[cell.rowIndex][cell.columnIndex] = cell.content ?? '';
+      }
+      const md = rows.filter(Boolean).map((r) => `| ${(r || []).map((c) => c ?? '').join(' | ')} |`);
+      return `Table ${i + 1} (${t.rowCount}x${t.columnCount}):\n${md.join('\n')}`;
+    })
+    .join('\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// MCP server
+// ---------------------------------------------------------------------------
+const handler = createMcpHandler(
+  (server) => {
+    server.tool(
+      'analyze_invoice',
+      'Extracts structured fields (vendor, customer, invoice id, dates, totals) from an invoice PDF or image using Azure Document Intelligence.',
+      sourceSchema,
+      async ({ base64Data, urlSource }) => {
+        try {
+          const result = await analyze('prebuilt-invoice', buildPayload(base64Data, urlSource));
+          const doc = result?.documents?.[0];
+          if (!doc) return { content: [{ type: 'text', text: 'No structured invoice data detected.' }] };
+          const text = renderFields(doc.fields || {}, [
+            'VendorName',
+            'CustomerName',
+            'InvoiceId',
+            'InvoiceDate',
+            'DueDate',
+            'SubTotal',
+            'TotalTax',
+            'InvoiceTotal',
+          ]);
+          return { content: [{ type: 'text', text }] };
+        } catch (e: any) {
+          return err(`Error processing invoice: ${e.message}`);
+        }
+      }
+    );
+
+    server.tool(
+      'analyze_layout_tables',
+      'Extracts paragraphs, page count and table contents from complex documents or PDFs. Returns tables as markdown.',
+      sourceSchema,
+      async ({ base64Data, urlSource }) => {
+        try {
+          const result = await analyze('prebuilt-layout', buildPayload(base64Data, urlSource));
+          const paragraphs = result?.paragraphs?.map((p: any) => p.content).join('\n') || '';
+          const output = [
+            `Total Pages: ${result?.pages?.length || 0}`,
+            `Total Tables Extracted: ${result?.tables?.length || 0}`,
+            `\n--- Text Content ---`,
+            paragraphs ? truncate(paragraphs) : 'No paragraph text extracted.',
+            `\n--- Tables ---`,
+            truncate(renderTables(result?.tables || []), 4000),
+          ].join('\n');
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e: any) {
+          return err(`Error reading layout: ${e.message}`);
+        }
+      }
+    );
+
+    // Opt-in only: extracts PII (name, DOB, document number).
+    if (ENABLE_ID_DOCUMENT) {
+      server.tool(
+        'analyze_id_document',
+        'Extracts identity fields from a passport, driver licence or ID card. Enabled only when ENABLE_ID_DOCUMENT=true.',
+        sourceSchema,
+        async ({ base64Data, urlSource }) => {
+          try {
+            const result = await analyze('prebuilt-idDocument', buildPayload(base64Data, urlSource));
+            const doc = result?.documents?.[0];
+            if (!doc) {
+              return { content: [{ type: 'text', text: 'No structured ID document data detected.' }] };
+            }
+            const text = renderFields(doc.fields || {}, [
+              'FirstName',
+              'LastName',
+              'DocumentNumber',
+              'DateOfBirth',
+              'DateOfExpiration',
+              'CountryRegion',
+            ]);
+            return { content: [{ type: 'text', text }] };
+          } catch (e: any) {
+            return err(`Error processing ID document: ${e.message}`);
+          }
+        }
+      );
+    }
+  },
+  // NOTE: 2nd arg is MCP `ServerOptions`, not name/version. The adapter
+  // hardcodes serverInfo.name to 'mcp-typescript server on vercel' for every
+  // server built with it — so your orchestrator registry must key MCP servers
+  // by its own configured id ('azure_doc'), never by the initialize response's
+  // name, or the two custom servers will collide.
+  {},
+  {
+    // 🔴 THE BUG FIX — see the vision server for the full explanation.
+    // Route lives at /api/mcp, but the adapter defaulted to matching "/mcp",
+    // so every request hit its fallback: 404 "Not found".
+    basePath: '/api',
+    maxDuration: 60,
+    verboseLogs: false,
+  }
+);
+
+async function guarded(request: Request): Promise<Response> {
+  if (AUTH_TOKEN) {
+    const got = request.headers.get('authorization');
+    const want = `Bearer ${AUTH_TOKEN}`;
+    if (!got || got.length !== want.length || got !== want) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+  }
+  return handler(request);
+}
+
+export const GET = guarded;
+export const POST = guarded;
